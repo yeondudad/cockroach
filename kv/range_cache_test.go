@@ -35,7 +35,7 @@ import (
 
 type testDescriptorDB struct {
 	data            llrb.Tree
-	cache           *rangeDescriptorCache
+	cache           *RangeDescriptorCache
 	lookupCount     int64
 	disablePrefetch bool
 	pauseChan       chan struct{}
@@ -177,7 +177,7 @@ func initTestDescriptorDB(t *testing.T) *testDescriptorDB {
 			db.splitRange(t, mustMeta(roachpb.RKey(string(char))))
 		}
 	}
-	db.cache = newRangeDescriptorCache(context.TODO(), db, 2<<10)
+	db.cache = NewRangeDescriptorCache(context.TODO(), db, 2<<10)
 	return db
 }
 
@@ -194,23 +194,23 @@ func (db *testDescriptorDB) assertLookupCount(t *testing.T, from, to int64, key 
 	db.lookupCount = 0
 }
 
-func doLookup(t *testing.T, rc *rangeDescriptorCache, key string) (*roachpb.RangeDescriptor, *evictionToken) {
+func doLookup(t *testing.T, rc *RangeDescriptorCache, key string) (*roachpb.RangeDescriptor, *EvictionToken) {
 	return doLookupWithToken(t, rc, key, nil, false, false, nil)
 }
 
-func doLookupConsideringIntents(t *testing.T, rc *rangeDescriptorCache, key string) (*roachpb.RangeDescriptor, *evictionToken) {
+func doLookupConsideringIntents(t *testing.T, rc *RangeDescriptorCache, key string) (*roachpb.RangeDescriptor, *EvictionToken) {
 	return doLookupWithToken(t, rc, key, nil, true, false, nil)
 }
 
 func doLookupWithToken(
 	t *testing.T,
-	rc *rangeDescriptorCache,
+	rc *RangeDescriptorCache,
 	key string,
-	evictToken *evictionToken,
+	evictToken *EvictionToken,
 	considerIntents bool,
 	useReverseScan bool,
 	wg *sync.WaitGroup,
-) (*roachpb.RangeDescriptor, *evictionToken) {
+) (*roachpb.RangeDescriptor, *EvictionToken) {
 	r, returnToken, pErr := rc.lookupRangeDescriptorInternal(
 		context.Background(), roachpb.RKey(key), evictToken, considerIntents, useReverseScan, wg)
 	if pErr != nil {
@@ -379,7 +379,7 @@ func TestRangeCacheDetectSplit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	db := initTestDescriptorDB(t)
 
-	pauseLookupResumeAndAssert := func(key string, expected int64, evictToken *evictionToken) {
+	pauseLookupResumeAndAssert := func(key string, expected int64, evictToken *EvictionToken) {
 		var wg, waitJoin sync.WaitGroup
 		db.pauseRangeLookups()
 		for i := 0; i < 3; i++ {
@@ -464,7 +464,7 @@ func TestRangeCacheDetectSplitReverseScan(t *testing.T) {
 	// be returned ([KeyMin-,"a") and ["an-b")).
 	lookups := []struct {
 		key        string
-		evictToken *evictionToken
+		evictToken *EvictionToken
 	}{
 		{"a", nil},
 		{"az", evictToken},
@@ -474,7 +474,7 @@ func TestRangeCacheDetectSplitReverseScan(t *testing.T) {
 	for _, lookup := range lookups {
 		wg.Add(1)
 		waitJoin.Add(1)
-		go func(key string, evictToken *evictionToken) {
+		go func(key string, evictToken *EvictionToken) {
 			doLookupWithToken(t, db.cache, key, evictToken, false, useReverseScan, &waitJoin)
 			wg.Done()
 		}(lookup.key, lookup.evictToken)
@@ -636,7 +636,7 @@ func TestRangeCacheClearOverlapping(t *testing.T) {
 		EndKey:   roachpb.RKeyMax,
 	}
 
-	cache := newRangeDescriptorCache(context.TODO(), nil, 2<<10)
+	cache := NewRangeDescriptorCache(context.TODO(), nil, 2<<10)
 	cache.rangeCache.cache.Add(rangeCacheKey(keys.RangeMetaKey(roachpb.RKeyMax)), defDesc)
 
 	// Now, add a new, overlapping set of descriptors.
@@ -731,7 +731,7 @@ func TestRangeCacheClearOverlappingMeta(t *testing.T) {
 		EndKey:   roachpb.RKeyMax,
 	}
 
-	cache := newRangeDescriptorCache(context.TODO(), nil, 2<<10)
+	cache := NewRangeDescriptorCache(context.TODO(), nil, 2<<10)
 	cache.rangeCache.cache.Add(rangeCacheKey(keys.RangeMetaKey(firstDesc.EndKey)),
 		firstDesc)
 	cache.rangeCache.cache.Add(rangeCacheKey(keys.RangeMetaKey(restDesc.EndKey)),
@@ -765,7 +765,7 @@ func TestGetCachedRangeDescriptorInclusive(t *testing.T) {
 		{StartKey: roachpb.RKey("g"), EndKey: roachpb.RKey("z")},
 	}
 
-	cache := newRangeDescriptorCache(context.TODO(), nil, 2<<10)
+	cache := NewRangeDescriptorCache(context.TODO(), nil, 2<<10)
 	for _, rd := range testData {
 		cache.rangeCache.cache.Add(rangeCacheKey(keys.RangeMetaKey(rd.EndKey)), rd)
 	}

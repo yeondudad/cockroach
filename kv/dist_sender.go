@@ -104,10 +104,10 @@ type DistSender struct {
 	// ranges.
 	gossip *gossip.Gossip
 	// rangeCache caches replica metadata for key ranges.
-	rangeCache           *rangeDescriptorCache
+	rangeCache           *RangeDescriptorCache
 	rangeLookupMaxRanges int32
 	// leaseHolderCache caches range lease holders by range ID.
-	leaseHolderCache *leaseHolderCache
+	leaseHolderCache *LeaseHolderCache
 	transportFactory TransportFactory
 	rpcContext       *rpc.Context
 	rpcRetryOptions  retry.Options
@@ -192,12 +192,12 @@ func NewDistSender(cfg *DistSenderConfig, g *gossip.Gossip) *DistSender {
 	if rdb == nil {
 		rdb = ds
 	}
-	ds.rangeCache = newRangeDescriptorCache(ds.Ctx, rdb, int(rcSize))
+	ds.rangeCache = NewRangeDescriptorCache(ds.Ctx, rdb, int(rcSize))
 	lcSize := cfg.LeaseHolderCacheSize
 	if lcSize <= 0 {
 		lcSize = defaultLeaseHolderCacheSize
 	}
-	ds.leaseHolderCache = newLeaseHolderCache(int(lcSize))
+	ds.leaseHolderCache = NewLeaseHolderCache(int(lcSize))
 	if cfg.RangeLookupMaxRanges <= 0 {
 		ds.rangeLookupMaxRanges = defaultRangeLookupMaxRanges
 	}
@@ -271,7 +271,7 @@ func (ds *DistSender) RangeLookup(
 		ConsiderIntents: considerIntents,
 		Reverse:         useReverseScan,
 	})
-	replicas := newReplicaSlice(ds.gossip, desc)
+	replicas := NewReplicaSlice(ds.gossip, desc)
 	replicas.Shuffle()
 	// TODO(tschottdorf): Ideally we would use the trace of the request which
 	// caused this lookup.
@@ -299,35 +299,6 @@ func (ds *DistSender) FirstRange() (*roachpb.RangeDescriptor, error) {
 		return nil, firstRangeMissingError{}
 	}
 	return rangeDesc, nil
-}
-
-// optimizeReplicaOrder sorts the replicas in the order in which they are to be
-// used for sending RPCs (meaning in the order in which they'll be probed for
-// the lease). "Closer" replicas (matching in more attributes) are ordered
-// first. Replicas matching in the same number of attributes are shuffled
-// randomly.
-// If the current node is a replica, then it'll be the first one.
-func (ds *DistSender) optimizeReplicaOrder(replicas ReplicaSlice) {
-	// TODO(spencer): going to need to also sort by affinity; closest
-	// ping time should win. Makes sense to have the rpc client/server
-	// heartbeat measure ping times. With a bit of seasoning, each
-	// node will be able to order the healthy replicas based on latency.
-
-	// Unless we know better, send the RPCs randomly.
-	nodeDesc := ds.getNodeDescriptor()
-	// If we don't know which node we're on, don't optimize anything.
-	if nodeDesc == nil {
-		replicas.Shuffle()
-		return
-	}
-	// Sort replicas by attribute affinity (if any), which we treat as a stand-in
-	// for proximity (for now).
-	replicas.SortByCommonAttributePrefix(nodeDesc.Attrs.Attrs)
-
-	// If there is a replica in local node, move it to the front.
-	if i := replicas.FindReplicaByNodeID(nodeDesc.NodeID); i > 0 {
-		replicas.MoveToFront(i)
-	}
 }
 
 // getNodeDescriptor returns ds.nodeDescriptor, but makes an attempt to load
@@ -401,8 +372,8 @@ func (ds *DistSender) sendRPC(
 func (ds *DistSender) CountRanges(rs roachpb.RSpan) (int64, error) {
 	var count int64
 	for {
-		desc, needAnother, _, err := ds.getDescriptors(
-			context.Background(), rs, nil, false /*useReverseScan*/)
+		desc, needAnother, _, err := ResolveKeySpanToFirstDescriptor(
+			context.Background(), ds.rangeCache, rs, nil /* evictToken */, false /*useReverseScan*/)
 		if err != nil {
 			return -1, err
 		}
@@ -413,62 +384,6 @@ func (ds *DistSender) CountRanges(rs roachpb.RSpan) (int64, error) {
 		rs.Key = desc.EndKey
 	}
 	return count, nil
-}
-
-// getDescriptors looks up the range descriptor to use for a query over the
-// key range span rs with the given options. The lookup takes into consideration
-// the last range descriptor that the caller had used for this key range span,
-// if any, and if the last range descriptor has been evicted because it was
-// found to be stale, which is all managed through the evictionToken. The
-// function should be provided with an evictionToken if one was acquired from
-// this function on a previous call. If not, an empty evictionToken can be provided.
-//
-// The range descriptor which contains the range in which the request should
-// start its query is returned first. Next returned is an evictionToken. In
-// case the descriptor is discovered stale, the returned evictionToken's evict
-// method should be called; it evicts the cache appropriately. Finally, the
-// returned bool is true in case the given range reaches outside the returned
-// descriptor.
-func (ds *DistSender) getDescriptors(
-	ctx context.Context, rs roachpb.RSpan, evictToken *evictionToken, useReverseScan bool,
-) (*roachpb.RangeDescriptor, bool, *evictionToken, error) {
-	var descKey roachpb.RKey
-	if !useReverseScan {
-		descKey = rs.Key
-	} else {
-		descKey = rs.EndKey
-	}
-
-	// When a previous descriptor has been used (when not warming
-	// the cache), allow [uncommitted] intents on range descriptor
-	// lookups to be returned in addition to live range descriptors.
-	// We cannot know with complete certainty whether a current
-	// intent or a previously committed value should be used to
-	// direct requests, but by looking up both, we can try both out
-	// without issuing a second lookup. This balances between
-	// the two cases where an intent's txn hasn't yet been
-	// committed (the previous value is correct), or an intent's
-	// txn has been committed (the intent value is correct).
-	//
-	// Note that with the current implementation of replica.RangeLookup,
-	// this will disable prefetching.
-	considerIntents := evictToken != nil
-
-	desc, returnToken, err := ds.rangeCache.LookupRangeDescriptor(
-		ctx, descKey, evictToken, considerIntents, useReverseScan)
-	if err != nil {
-		return nil, false, returnToken, err
-	}
-
-	// Checks whether need to get next range descriptor.
-	var needAnother bool
-	if useReverseScan {
-		needAnother = rs.Key.Less(desc.StartKey)
-	} else {
-		needAnother = desc.EndKey.Less(rs.EndKey)
-	}
-
-	return desc, needAnother, returnToken, nil
 }
 
 // sendSingleRange gathers and rearranges the replicas, and makes an RPC call.
@@ -488,12 +403,12 @@ func (ds *DistSender) sendSingleRange(
 	}
 
 	// Try to send the call.
-	replicas := newReplicaSlice(ds.gossip, desc)
+	replicas := NewReplicaSlice(ds.gossip, desc)
 
 	// Rearrange the replicas so that those replicas with long common
 	// prefix of attributes end up first. If there's no prefix, this is a
 	// no-op.
-	ds.optimizeReplicaOrder(replicas)
+	replicas.OptimizeReplicaOrder(ds.getNodeDescriptor())
 
 	// If this request needs to go to a lease holder and we know who that is, move
 	// it to the front.
@@ -797,20 +712,18 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 		var nextRS roachpb.RSpan
 		var desc *roachpb.RangeDescriptor
 		var needAnother bool
-		var evictToken *evictionToken
+		var evictToken *EvictionToken
 
 		// Retry loop for looking up next range in the span. The retry loop
 		// deals with retryable range descriptor lookups.
 		for r := retry.StartWithCtx(ctx, ds.rpcRetryOptions); r.Next(); {
 			log.Tracef(ctx, "meta descriptor lookup for range %s", rs)
 			var err error
-			desc, needAnother, evictToken, err = ds.getDescriptors(ctx, rs, evictToken, isReverse)
+			desc, needAnother, evictToken, err = ResolveKeySpanToFirstDescriptor(
+				ctx, ds.rangeCache, rs, evictToken, isReverse)
 
-			// getDescriptors may fail retryably if, for example, the first
-			// range isn't available via Gossip. Assume that all errors at
-			// this level are retryable. Non-retryable errors would be for
-			// things like malformed requests which we should have checked
-			// for before reaching this point.
+			// We assume that all errors coming from ResolveKeySpanToFirstDescriptor
+			// are retryable, as per its documentation.
 			if err != nil {
 				log.VTracef(1, ctx, "range descriptor lookup failed: %s", err)
 				continue
@@ -893,7 +806,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 		if ba.MaxSpanRequestKeys == 0 && needAnother && ds.allocAsyncSender() {
 			// Note that we pass the batch request by value to the parallel
 			// goroutine to avoid using the cloned txn.
-			go func(ba roachpb.BatchRequest, rs roachpb.RSpan, desc *roachpb.RangeDescriptor, evictToken *evictionToken, isFirst bool) {
+			go func(ba roachpb.BatchRequest, rs roachpb.RSpan, desc *roachpb.RangeDescriptor, evictToken *EvictionToken, isFirst bool) {
 				responseCh <- ds.sendPartialBatch(ctx, &ba, rs, desc, evictToken, isFirst)
 				ds.freeAsyncSender()
 			}(*ba, rs, desc, evictToken, isFirst)
@@ -954,7 +867,7 @@ func (ds *DistSender) sendPartialBatch(
 	ba *roachpb.BatchRequest,
 	rs roachpb.RSpan,
 	desc *roachpb.RangeDescriptor,
-	evictToken *evictionToken,
+	evictToken *EvictionToken,
 	isFirst bool,
 ) *response {
 	var reply *roachpb.BatchResponse
@@ -980,7 +893,8 @@ func (ds *DistSender) sendPartialBatch(
 	for r := retry.StartWithCtx(ctx, ds.rpcRetryOptions); r.Next(); {
 		// If we've cleared the descriptor on a send failure, re-lookup.
 		if desc == nil {
-			desc, _, evictToken, err = ds.getDescriptors(ctx, intersected, nil, ba.IsReverse())
+			desc, _, evictToken, err = ResolveKeySpanToFirstDescriptor(
+				ctx, ds.rangeCache, intersected, nil /* evictToken */, ba.IsReverse())
 			if err != nil {
 				log.VTracef(1, ctx, "range descriptor re-lookup failed: %s", err)
 				continue
@@ -1285,4 +1199,15 @@ func (ds *DistSender) updateLeaseHolderCache(
 		}
 	}
 	ds.leaseHolderCache.Update(rangeID, newLeaseHolder)
+}
+
+// GetRangeDescriptorCache returns the DistSender's range cache. The cache can
+// be shared by others.
+func (ds *DistSender) GetRangeDescriptorCache() *RangeDescriptorCache {
+	return ds.rangeCache
+}
+
+// GetLeaseHolderCache returns the lease holder cache used by the DistSender.
+func (ds *DistSender) GetLeaseHolderCache() *LeaseHolderCache {
+	return ds.leaseHolderCache
 }
