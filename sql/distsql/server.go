@@ -22,7 +22,9 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/internal/client"
+	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/sql/parser"
@@ -37,6 +39,9 @@ type ServerConfig struct {
 	Context    context.Context
 	DB         *client.DB
 	RPCContext *rpc.Context
+	NodeDesc   roachpb.NodeDescriptor
+	Gossip     *gossip.Gossip
+	DistSender *kv.DistSender
 	Stopper    *stop.Stopper
 }
 
@@ -44,6 +49,7 @@ type ServerConfig struct {
 type ServerImpl struct {
 	ServerConfig
 	evalCtx      parser.EvalContext
+	leaderFinder *LeaseHolderResolver
 	flowRegistry *flowRegistry
 }
 
@@ -60,6 +66,10 @@ func NewServer(cfg ServerConfig) *ServerImpl {
 		evalCtx: parser.EvalContext{
 			ReCache: parser.NewRegexpCache(512),
 		},
+		leaderFinder: NewLeaseHolderResolver(
+			cfg.DistSender, cfg.Gossip, cfg.NodeDesc, cfg.Stopper,
+			// TODO(andrei): allow control over this policy
+			RandomLHGuessingPolicy),
 		flowRegistry: makeFlowRegistry(),
 	}
 	return ds

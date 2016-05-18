@@ -1142,7 +1142,7 @@ func (ds *DistSender) sendToReplicas(
 				// TODO(bdarnell): The last error is not necessarily the best
 				// one to return; we may want to remember the "best" error
 				// we've seen (for example, a NotLeaseHolderError conveys more
-				// information than a RangeNotFound).
+				// information than a RangeNotFoundError).
 				err = call.Reply.Error.GoError()
 			} else if log.V(1) {
 				log.Warningf(opts.ctx, "RPC error: %s", err)

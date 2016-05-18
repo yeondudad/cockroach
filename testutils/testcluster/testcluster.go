@@ -386,20 +386,16 @@ func (tc *TestCluster) TransferRangeLease(
 
 // FindRangeLeaseHolder returns the current lease holder for the given range. If
 // there is no lease at the time of the call, a replica gets one as a
-// side-effect of calling this; if hint is not nil, that replica will be the
-// one.
+// side-effect of calling this.
 //
 // One of the Stores in the cluster (namely, the hint, if one is passed) is used
-// as a Sender to send a dummy read command, which will either result in success
-// (if a replica on that Node has the lease), in a NotLeaseHolderError pointing
-// to the current lease holder (if there is an active lease), or in the replica
-// on that store acquiring the lease (if there isn't an active lease).
-// If an active lease existed for the range, it's extended as a side-effect.
-//
-// Note that not all nodes have necessarily applied the latest lease,
-// particularly immediately after a TransferRangeLease() call. So specifying
-// different hints can yield different results. The one server that's guaranteed
-// to have applied the transfer is the previous lease holder.
+// to query for lease information. If that node has a replica of the range, then
+// that replica is queried for the lease. In particular, if this replica has
+// been the last to transfer away the lease, then it is guaranteed to have
+// up-to-date lease information. Other replicas might have stale info, including
+// the latest transfer target.
+// Moreover, if there is no active lease and the hint node has a replica, that
+// replica will try to acquire the lease.
 func (tc *TestCluster) FindRangeLeaseHolder(
 	rangeDesc *roachpb.RangeDescriptor,
 	hint *ReplicationTarget,
